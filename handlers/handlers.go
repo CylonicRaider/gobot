@@ -82,17 +82,17 @@ func (u *UptimeHandler) HandleIncoming(r *gobot.Room, p *proto.Packet) (*proto.P
 	if !strings.HasPrefix(payload.Content, "!uptime") {
 		return nil, nil
 	}
-	if payload.Content != "!uptime" && payload.Content != "!uptime @" + r.BotName {
+	if payload.Content != "!uptime" && payload.Content != "!uptime @"+r.BotName {
 		return nil, nil
 	}
 	uptime := time.Since(u.t0)
-	days := int(uptime.Hours() / 24)
-	hours := int(uptime.Hours() % 24)
-	minutes := int(uptime.Minutes() % 60)
-	seconds := uptime.Seconds() % 60
+	days := int(uptime.Hours()) / 24
+	hours := int(uptime.Hours()) % 24
+	minutes := int(uptime.Minutes()) % 60
+	seconds := int(uptime.Seconds()) % 60
 	if _, err := r.SendText(&payload.ID, fmt.Sprintf(
-			"This bot has been up for %dd %dh %dm %.3fs.",
-			days, hours, minutes, seconds)); err != nil {
+		"This bot has been up for %dd %dh %dm %.3fs.",
+		days, hours, minutes, seconds)); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -101,11 +101,6 @@ func (u *UptimeHandler) HandleIncoming(r *gobot.Room, p *proto.Packet) (*proto.P
 // Stop is a no-op.
 func (u *UptimeHandler) Stop(r *gobot.Room) {
 	return
-}
-
-type HelpHandler struct {
-	ShortDesc string
-	LongDesc  string
 }
 
 // HelpHandler stores a short help message and a long help message and responds

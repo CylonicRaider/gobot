@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"euphoria.io/heim/proto"
 	"euphoria.io/heim/proto/snowflake"
@@ -19,7 +20,7 @@ const (
 )
 
 func init() {
-	logrus.SetLevel(logrus.WarnLevel)
+	logrus.SetLevel(logrus.InfoLevel)
 }
 
 // MakePacket is a convenience function that takes a payload and a PacketType
@@ -49,7 +50,7 @@ type Bot struct {
 	BotName string
 	ctx     scope.Context
 	DB      *bolt.DB
-	logger  *logrus.Logger
+	Logger  *logrus.Logger
 	cmd     chan interface{}
 }
 
@@ -95,7 +96,7 @@ func NewBot(cfg BotConfig) (*Bot, error) {
 		BotName: cfg.Name,
 		ctx:     ctx,
 		DB:      db,
-		logger:  logger,
+		Logger:  logger,
 		cmd:     cmd,
 	}, nil
 }
@@ -111,9 +112,8 @@ type RoomConfig struct {
 // AddRoom adds a new Room to the bot with the given configuration. The context
 // for this room is distinct from the Bot's context.
 func (b *Bot) AddRoom(cfg RoomConfig) {
+	b.Logger.Debugf("%s", len(cfg.AddlHandlers))
 	ctx := scope.New()
-	var handlers []Handler
-	handlers = append(handlers, cfg.AddlHandlers...)
 	logger := logrus.New()
 	logger.Level = logrus.DebugLevel
 	room := Room{
@@ -125,7 +125,7 @@ func (b *Bot) AddRoom(cfg RoomConfig) {
 		BotName:  b.BotName,
 		msgID:    0,
 		Logger:   logger,
-		Handlers: handlers,
+		Handlers: cfg.AddlHandlers,
 		DB:       b.DB,
 		conn:     cfg.Conn,
 	}
@@ -133,16 +133,18 @@ func (b *Bot) AddRoom(cfg RoomConfig) {
 }
 
 func (r *Room) sendLoop() {
+	defer r.Ctx.WaitGroup().Done()
 	for {
 		select {
 		case <-r.Ctx.Done():
-			r.Ctx.WaitGroup().Done()
+			r.Logger.Debugln("sendLoop exiting...")
 			return
 		case msg := <-r.outbound:
 			r.Logger.Debugf("Sending message of type %s...", msg.Type)
 			if _, err := r.conn.SendJSON(r, msg); err != nil {
-				logrus.Errorf("Error sending JSON: %s", err)
+				logrus.Errorf("Error sending JSON, terminating room: %s", err)
 				r.Ctx.Terminate(err)
+				return
 			}
 		}
 	}
@@ -150,30 +152,34 @@ func (r *Room) sendLoop() {
 }
 
 func (r *Room) recvLoop() {
+	defer r.Ctx.WaitGroup().Done()
 	for {
 		pchan := make(chan *proto.Packet)
 		go r.conn.ReceiveJSON(r, pchan)
 		select {
 		case <-r.Ctx.Done():
+			r.Logger.Debugln("recvLoop exiting...")
 			close(pchan)
-			r.Ctx.WaitGroup().Done()
 			return
 		case p := <-pchan:
-			r.inbound <- p
+			if p != nil {
+				r.inbound <- p
+			}
 		}
 	}
 }
 
 func (r *Room) runHandlerIncoming(handler Handler, p proto.Packet) {
-	defer r.Ctx.Done()
+	// defer r.Ctx.WaitGroup().Done()
+	r.Logger.Debugln("runHandlerIncoming")
 	retPacket, err := handler.HandleIncoming(r, &p)
 	if err != nil {
+		r.Logger.Errorf("Error in handler, shutting down room: %s", err)
 		r.Ctx.Terminate(err)
 		return
 	}
 	if retPacket != nil {
 		r.outbound <- retPacket
-	} else {
 	}
 }
 
@@ -196,17 +202,58 @@ func (r *Room) dispatcher() {
 	for {
 		select {
 		case <-r.Ctx.Done():
+			r.Logger.Debugln("dispatcher exiting...")
 			return
 		case p := <-r.inbound:
 			r.Logger.Debugf("Dispatching packet of type %s", p.Type)
 			if p.Type == proto.PingEventType {
 				err := r.handlePing(p)
 				if err != nil {
+					r.Logger.Errorf("Error handling ping, shutting down room: %s", err)
 					r.Ctx.Terminate(err)
 					return
 				}
+			} else if p.Type == proto.ErrorReplyType {
+				r.Logger.Errorf("Error packet received- full contents: %s", p)
+				r.Ctx.Cancel()
+				return
+			} else if p.Error != "" {
+				r.Logger.Errorf("Error in packet: %s", p.Error)
+				r.Ctx.Cancel()
+				return
+			} else if p.Type == proto.BounceEventType {
+				payload, err := p.Payload()
+				if err != nil {
+					r.Logger.Error("Could not extract payload.")
+					r.Ctx.Cancel()
+					return
+				}
+				bounce, ok := payload.(*proto.BounceEvent)
+				if !ok {
+					r.Logger.Error("Could not assert BounceEvent as such.")
+					r.Ctx.Cancel()
+					return
+				}
+				r.Logger.Errorf("Bounced: %s", bounce.Reason)
+			} else if p.Type == proto.DisconnectEventType {
+				payload, err := p.Payload()
+				if err != nil {
+					r.Logger.Error("Could not extract payload.")
+					r.Ctx.Cancel()
+					return
+				}
+				disc, ok := payload.(*proto.DisconnectEvent)
+				if !ok {
+					r.Logger.Error("Could not assert DisconnectEvent as such.")
+					r.Ctx.Cancel()
+					return
+				}
+				r.Logger.Errorf("disconnect-event received: reason: %s", disc.Reason)
+				r.Ctx.Cancel()
+				return
 			}
 			for _, handler := range r.Handlers {
+				r.Logger.Debugln("Running handler...")
 				r.runHandlerIncoming(handler, *p)
 			}
 		}
@@ -216,6 +263,7 @@ func (r *Room) dispatcher() {
 func (r *Room) queuePayload(payload interface{}, pType proto.PacketType) string {
 	msg, err := MakePacket(pType, payload)
 	if err != nil {
+		r.Logger.Errorf("Error making packet, shutting room down: %s", err)
 		r.Ctx.Terminate(err)
 		return ""
 	}
@@ -262,11 +310,14 @@ func (r *Room) SendText(parent *snowflake.Snowflake, msg string) (string, error)
 // Run starts up the necessary goroutines to send, receive, and dispatch packets
 // to handlers.
 func (r *Room) Run() error {
+	go r.monitorLoop()
+
 	r.Ctx.WaitGroup().Add(1)
 	go r.sendLoop()
 
 	if err := r.conn.Connect(r); err != nil {
 		r.Ctx.Terminate(err)
+		r.Logger.Errorf("Error on initial connect to room: %s", err)
 		r.Ctx.WaitGroup().Wait()
 		return err
 	}
@@ -279,8 +330,8 @@ func (r *Room) Run() error {
 	for _, handler := range r.Handlers {
 		go handler.Run(r)
 	}
-
 	<-r.Ctx.Done()
+	r.Logger.Warnf("Room %s's context is finished.", r.RoomName)
 	return fmt.Errorf("Fatal error in room %s: %s", r.RoomName, r.Ctx.Err())
 }
 
@@ -288,31 +339,63 @@ func (r *Room) Run() error {
 // only return when all rooms are exited- common usage will be running this as
 // a goroutine.
 func (b *Bot) RunAllRooms() {
+	go b.monitorLoop()
 	errChan := make(chan error, len(b.Rooms))
 	for _, room := range b.Rooms {
 		b.ctx.WaitGroup().Add(1)
 		go func(r *Room) {
+			defer b.ctx.WaitGroup().Done()
 			err := r.Run()
+			r.Logger.Errorf("Error in room %s: %s", room.RoomName, err)
+			if err = r.Stop(); err != nil {
+				r.Logger.Errorf("Error stopping room %s: %s", room.RoomName, err)
+			}
 			errChan <- err
-			b.ctx.WaitGroup().Done()
 		}(room)
 	}
 	go func() {
 		b.ctx.WaitGroup().Wait()
+		b.Logger.Warnln("Bot waitgroup finished.")
 		close(errChan)
 	}()
 	for err := range errChan {
-		b.logger.Errorf("%s", err)
+		b.Logger.Errorf("%s", err)
+	}
+}
+
+func (r *Room) monitorLoop() {
+	for {
+		<-time.After(120 * time.Second)
+		if r.Ctx.Alive() {
+			r.Logger.Debugln("Context is alive.")
+		} else {
+			r.Logger.Debugln("Context is dead.")
+		}
+	}
+}
+
+func (b *Bot) monitorLoop() {
+	for {
+		<-time.After(120 * time.Second)
+		if b.ctx.Alive() {
+			b.Logger.Debugln("Context is alive.")
+		} else {
+			b.Logger.Debugln("Context is dead.")
+		}
 	}
 }
 
 // Stop cancels a Room's context, closes the connection, and waits for all
 // goroutines spawned by the Room to stop.
 func (r *Room) Stop() error {
+	r.Logger.Warningf("Room '%s' shutting down", r.RoomName)
 	r.Ctx.Cancel()
+	r.Logger.Debugln("Closing connection...")
 	if err := r.conn.Close(); err != nil {
+		r.Logger.Debugf("Error closing connection: %s", err)
 		return err
 	}
+	r.Logger.Debugln("Waiting for graceful shutdown...")
 	r.Ctx.WaitGroup().Wait()
 	return nil
 }
@@ -322,12 +405,12 @@ func (r *Room) Stop() error {
 func (b *Bot) Stop() {
 	for _, room := range b.Rooms {
 		if err := room.Stop(); err != nil {
-			b.logger.Errorf("Error stopping room: %s", err)
+			b.Logger.Errorf("Error stopping room: %s", err)
 		}
 	}
 	b.ctx.Cancel()
 	b.ctx.WaitGroup().Wait()
 	if err := b.DB.Close(); err != nil {
-		b.logger.Errorf("Error closing database: %s", err)
+		b.Logger.Errorf("Error closing database: %s", err)
 	}
 }
